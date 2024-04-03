@@ -48,31 +48,21 @@ bool file_backed_initializer(struct page *page, enum vm_type type, void *kva)
     return true;
 }
 
-/* Swap in the page by read contents from the file. */
 static bool
 file_backed_swap_in(struct page *page, void *kva)
 {
     struct file_page *file_page UNUSED = &page->file;
-    if(page==NULL){
-		return false;
-	}
-    struct necessary_info *nec = file_page->aux;
-    struct file* file = nec->file;
-    off_t ofs = nec->ofs;
-    size_t read_byte = nec->read_byte;
-    size_t zero_byte = PGSIZE-read_byte;
+    struct necessary_info *nec = (struct necessary_info *)file_page->aux;
+
+    file_seek(nec->file, nec->ofs);
     lock_acquire(&file_lock);
-    file_seek(file,ofs);
-    if(file_read(file,kva,read_byte) != (int)read_byte)
-    {
-        lock_release(&file_lock);
-        return false;
-    }
-    memset(kva+read_byte,0,zero_byte);
+    file_read(file_page->file, kva, nec->read_byte);
     lock_release(&file_lock);
+
+    memset(kva + nec->read_byte, 0, nec->zero_byte);
+
     return true;
 }
-
 /* Swap out the page by writeback contents to the file. */
 static bool
 file_backed_swap_out(struct page *page)
@@ -110,8 +100,7 @@ file_backed_destroy(struct page *page)
 }
 
 /* Do the mmap */
-void *
-do_mmap(void *addr, size_t length, int writable,
+void *do_mmap(void *addr, size_t length, int writable,
         struct file *file, off_t offset)
 {
     // offset ~ length
@@ -133,7 +122,6 @@ do_mmap(void *addr, size_t length, int writable,
     {
         size_t page_read_bytes = read_byte < PGSIZE ? read_byte : PGSIZE;
         size_t page_zero_bytes = PGSIZE - page_read_bytes;
-        // printf("ofs %d\n", offset);
 
         struct necessary_info *nec = (struct necessary_info *)malloc(sizeof(struct necessary_info));
         nec->file = open_file;
@@ -194,7 +182,6 @@ void do_munmap(void *addr)
 
         struct necessary_info *nec = (struct necessary_info *)find_page->uninit.aux;
         find_page->file.aux = nec;
-        // printf("before %p\n", nec);
         file_backed_destroy(find_page);
 
         addr += PGSIZE;

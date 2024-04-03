@@ -30,10 +30,9 @@ static struct lock swap_lock;
 /* Initialize the data for anonymous pages */
 void vm_anon_init(void)
 {
-    /* TODO: Set up the swap_disk. */
     hash_init(&swap_table, anon_page_hash, anon_page_less, NULL);
     lock_init(&swap_lock);
-    swap_disk = disk_get(1, 1); // swap
+    swap_disk = disk_get(1, 1); 
 
     disk_sector_t swap_size = disk_size(swap_disk) / 8;
     for (disk_sector_t i = 0; i < swap_size; i++)
