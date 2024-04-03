@@ -1015,3 +1015,6 @@ static bool file_backed_swap_in(struct page *page, void *kva)
     return true;
 }
 ```
+tests/vm/swap-iter 테스트 케이스에 문제가 발생했다.
+이때 memset()이 없으면 file_read()이 이후 부분에 쓰레기 값이 남아있었다.
+따라서 memset()으로 사용하지 않은 부분을 0으로 세팅해 주었다.
