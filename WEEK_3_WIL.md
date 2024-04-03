@@ -62,7 +62,7 @@ hash\_find() 할 때 페이지의 &page->h\_elem을 사용하는데 저 페이�
 그런데 왜 해시에서 찾아질까? 하는 의문이 있었다.  
 조교님께 질문을 했고 답을 얻을 수 있었다.
 
-[##_Image|kage@LCVWd/btsGjZ1f0lh/8WSgc5WjZKiC1ILUcCixX0/img.png|CDM|1.3|{"originWidth":657,"originHeight":429,"style":"alignCenter"}_##]
+![img](./screenshoot.png)
 
 **pg\_round\_down()를 사용한 이유**  
 va가 가리키는 가상 페이지의 시작을 가리켜야 코드 진행 중 다른 페이지의 영역을 침범하지 않는다.
