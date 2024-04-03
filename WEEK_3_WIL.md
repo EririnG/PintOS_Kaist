@@ -6,778 +6,1012 @@ Memory Management ~ Swap In/Out
 
 ---
 
-alarm-single
+## Supplemental Page Table
 
-문제: timer_sleep이 기존에 구현되어 있었으나, Busy-wait을 하는 방식으로 되어있었기 때문에 효율이 좋지 않았다. 
+이번 프로젝트3에서 보조 페이지 테이블에 대한 설계를 진행했어야 했다.
 
-기존 함수:
-```c
-void
-timer_sleep (int64_t ticks) {
-	int64_t start = timer_ticks ();
+### 보조 페이지 테이블이란?
 
-	ASSERT (intr_get_level () == INTR_ON);
-	while (timer_elapsed (start) < ticks)
-		thread_yield ();
-}
-```
-기존 함수는 while문을 돌면서 시간을 확인하고, 충분한 시간이 되기 전까지 계속 yield를 시도한다.  
+> 이 시점에서 핀토스는 가상 및 물리 메모리 매핑을 관리하는 페이지 테이블(pml4)을 가집니다.  
+> 하지만, 이것은 충분하지 않습니다. 이전 섹션에서 설명한 대로 페이지 폴트 및 자원 관리를 처리하면 각 페이지에 대한 추가 정보를 저장할 수 있는 추가 페이지 테이블도 필요합니다. 따라서 프로젝트 3의 첫 번째 작업으로 추가 페이지 테이블에 대한 몇 가지 기본 기능을 구현하는 것을 제안합니다. - GitBook
 
-수정된 함수:
-```c
-void
-timer_sleep (int64_t ticks) {
-	
-	int64_t start = timer_ticks ();
-=
-	ASSERT(intr_get_level() == INTR_ON);
+기존의 페이지 테이블은 어떠한 가상 메모리 주소에 대한 페이지와 프레임, 여러 비트들만 가지고 있었다.  
+이 정보로는 가상메모리를 관리하는데 충분하지 않아 보조 페이지 테이블 필요했다.  
+보조 페이지 테이블은 Page fault가 발생하면 페이지를 조회하여 그곳에 어떤 데이터가 있는지 알아내고, 프로세스가 종료될 때 보조 페이지 테이블을 참조하여 어떤 리소스를 해제할지 결정한다.
 
-	thread_sleep(ticks+start);
-```
-수정된 함수는 그저 쓰레드를 재울 뿐, 이후 깨우는 과정은 timer_interrupt함수를 통해 진행된다. 
-쓰레드가 양보할 필요는 없이, 시간이 지났다면 ready list에 넣기만 해주면 된다. 
+보조 페이지 테이블을 구현할 때 여러 자료 구조를 사용할 수 있는데 우리 팀은 해시 테이블을 사용했다.
 
----
-
-문제 해결  
-
-<b>전역변수:</b>
-```c
-static struct list sleep_list;
-```
-Sleep list를 만들어 '잠든' 쓰레드를 모두 보관하고 관리할 수 있도록 하였다.  
-해당 리스트에는 추후 나올 함수인 'thread_sleep'를 통해 재운 함수들이 들어간다.  
-
-구조체 변경:  
-```c
-struct thread {
-	tid_t tid;                        
-	enum thread_status status;         
-	char name[16];                     
-	int priority;                       
-    int64_t sleep_ticks; // 해당 변수 추가
-
-	struct list_elem elem;     
-
-    //등등
-}
-```
-쓰레드가 'thread_sleep'를 통해 잠들 때, 잠들어있을 시간을 보관할 변수를 추가한다. 
-
-함수:
-```c
-void thread_sleep(int64_t ticks){
-
-	struct thread *t = thread_current();
-	enum intr_level old_level;
-	t->sleep_ticks = ticks;
-
-	old_level = intr_disable();
-	list_insert_ordered(&sleep_list, &t->elem, sleep_list_order, NULL);
-	thread_block();
-	intr_set_level(old_level);
-}
-
-
-void thread_wakeup(int64_t ticks) {
-  enum intr_level old_level;
-  old_level = intr_disable();
-
-    struct list_elem *waking_up = list_front(&sleep_list);
-    struct thread *checker = list_entry(waking_up, struct thread, elem);
-
-    if (checker->sleep_ticks <= (ticks)) {
-      waking_up = list_pop_front(&sleep_list);
-      list_push_back(&ready_list, waking_up);
-    } else {
-      break;
-    }
-
-
-  intr_set_level(old_level);
-}
-
-static bool sleep_list_order(const struct list_elem *a_, const struct list_elem *b_,
-            void *aux UNUSED){
-  const struct thread *a = list_entry (a_, struct thread, elem);
-  const struct thread *b = list_entry (b_, struct thread, elem);
-
-  return a->sleep_ticks < b->sleep_ticks;
-}
-```
-thread_sleep은 쓰레드를 재우며, 이는 특정 정책(policy)에 따라 sleep list에 정렬된 위치로 삽입하고 block하는 방식으로 실행된다.  
-이 때 사용된 정책은 sleep_list_order로, sleep_tick의 대소관계에 따라 오름차순으로 정렬 및 삽입된다. 
-
-이 때 주의해야 할 점은, block을 하기 전에 interrupt가 비활성화 되어있어야 한다는 점이다. 
-활성화가 되어있다면, 지속되는 interrupt로 인해 효율이 감소하며, 이는 원래 취지인 효율성의 상승과 상반된다. 
-
-thread_wakeup은 일정한 주기로 실행되는 timer_interrupt함수로부터 호출된다.
-
-thread_wakeup은 sleep_list의 front원소를 확인하며, OS가 부팅된 시점부터의 시간이 쓰레드가 일어나야 할 시간을  
-초과했을 때 해당 쓰레드는 list_pop_front를 통해 sleep list를 탈출하고 ready list로 들어간다.
-
-이렇게 구현해두면 alarm-multiple도 성공된다.   
-
---- 
- alarm-simultaneous
-
-
-문제: 
-두 개 이상의 쓰레드가 깨워지는 시간이 동일할 때를 다루는 과제이다. 
-
-해결: 
-해당 과제는 thread_wakeup에 조그마한 수정을 통해 해결되었다. 
-```c
-void thread_wakeup(int64_t ticks) {
-  enum intr_level old_level;
-  old_level = intr_disable();
-
-  while (!list_empty(&sleep_list)) {
-    struct list_elem *waking_up = list_front(&sleep_list);
-    struct thread *checker = list_entry(waking_up, struct thread, elem);
-
-    if (checker->sleep_ticks <= (ticks)) {
-      waking_up = list_pop_front(&sleep_list);
-      list_push_back(&ready_list, waking_up);
-    } else {
-      break;
-    }
-  }
-}
-```
-
-기존에 있던 함수의 깨우는 부분을 while문으로 감싸주면 된다.  
-이렇게 하면 여러 쓰레드가 일어날 시간이 되었다면 모두 ready list에 삽입하고 나서야 while문을 탈출한다. 
-
----
-
-alarm-priority
-
-문제: 
-쓰레드에 우선도가 추가되어, 꺠어난 후 ready list에 들어갈 때 우선도에 따라 삽입 및 정렬되어야 한다.  
-
-해결:
-위의 sleep list에 넣어줄 때와 비슷하게, ready list로 들어갈 때의 정책을 만들어줬다.  
-
-```c
-static bool priority_scheduling(const struct list_elem *a_, const struct list_elem *b_,
-            void *aux UNUSED){
-	const struct thread *a = list_entry (a_, struct thread, elem);
-	const struct thread *b = list_entry (b_, struct thread, elem);
-
-	return a->priority > b->priority;
-}
-```
-두 정책의 주요 차이점은 sleep_tick은 오름차순으로 정렬되는 것에 비해, priority는 내림차순으로 정렬된다는 점이다.  
-
-해당 정책은 sleep_list에서 Unblock되어 ready_list로 갈 때 사용되기 떄문에,  
-thread_unblock함수 안에 list_push_back 대신 list_insert_ordered로 변경하여 사용되었다.  
-
-```c
-void
-thread_unblock (struct thread *t) {
-	enum intr_level old_level;
-
-	ASSERT (is_thread (t));
-
-	old_level = intr_disable ();
-	ASSERT (t->status == THREAD_BLOCKED);
-
-	/* 쓰레드가 언블락되면 ready_list에 우선순위에 따라서 넣는 부분 */
-	list_insert_ordered(&ready_list, &t->elem, priority_scheduling, NULL);
-	//list_push_back (&ready_list, &t->elem);
-	t->status = THREAD_READY;
-	intr_set_level (old_level);
-}
-```
-
----
-
-alarm-zero & alarm-negative
-
-사실 기존에 만든 것으로도 통과되긴 했지만,  
-코드의 효율을 위해 아래 줄을 추가해줬다.  
-```c
-timer_sleep (int64_t ticks) {
-	
-	int64_t start = timer_ticks ();
-
-	if(ticks <= 0)  //이 부분 추가
-		return;
-}
-```
-
-priority-change 
-
-문제:
-1) 더 높은 우선순위의 쓰레드가 ready list에 들어오면 즉시 양보해야 한다.
-2) 언제든 자신의 우선순위를 바꿀 수 있지만, 이로 인해 다른 쓰레드보다 우선순위가 낮아지게 되면 즉시 양보해야 한다. 
-
-해결: 
-두 개의 함수를 수정하여 해결하였다. 
-```c
-tid_t
-thread_create (const char *name, int priority,
-		thread_func *function, void *aux) {
-	struct thread *t;
-	tid_t tid;
-
-	ASSERT (function != NULL);
-
-	/* Allocate thread. */
-	t = palloc_get_page (PAL_ZERO);
-	if (t == NULL)
-		return TID_ERROR;
-
-	/* Initialize thread. */
-	init_thread (t, name, priority);
-	tid = t->tid = allocate_tid ();
-
-	/* Call the kernel_thread if it scheduled.
-	 * Note) rdi is 1st argument, and rsi is 2nd argument. */
-	t->tf.rip = (uintptr_t) kernel_thread;
-	t->tf.R.rdi = (uint64_t) function;
-	t->tf.R.rsi = (uint64_t) aux;
-	t->tf.ds = SEL_KDSEG;
-	t->tf.es = SEL_KDSEG;
-	t->tf.ss = SEL_KDSEG;
-	t->tf.cs = SEL_KCSEG;
-	t->tf.eflags = FLAG_IF;
-
-	/* Add to run queue. */
-	thread_unblock (t);
-
-	if (thread_get_priority() < priority){ //이 부분 추가
-
-		thread_yield();		
-	}
-
-	return tid;
-}
-
-void
-thread_set_priority (int new_priority) {
-	thread_current ()->priority = new_priority;
-	// printf("%d\n", new_priority);	
-	//새 priority가 더 낮은지 확인
-	//Ready List에 더 높은 우선순위가 있다면 양보
-	struct list_elem *max_elem = list_max(&ready_list, priority_scheduling, NULL);
-	struct thread *next = list_entry(max_elem, struct thread, elem);
-	if (thread_get_priority() < next->priority){
-
-		thread_yield();	
-	}
-}
+## 우리 팀이 구현한 코드
 
 ```
-thread_create함수에 새로 생성된 쓰레드의 우선도가 현재 실행되는 쓰레드의 우선도보다 높으면 thread_yield함수를 통해 양보하도록 했다.
-
-비슷하게, thread_set_priority함수에 현재 쓰레드(우선도를 바꾼 쓰레드)의 우선도가 ready list의 대기하는 가장 앞 쓰레드의 우선도보다 낮아지면 양보하도록 했다. 
-(ready list의 가장 앞 쓰레드는 ready list의 모든 쓰레드 중 가장 높은 우선도를 갖게 정렬했다.)
-
----
-
-priority-donate-one
-
-문제: 
-만약 현재 돌아가는 쓰레드의 우선도가 새로 생성된 쓰레드의 우선도보다 낮으면서,  
-새로 생성된 쓰레드가 필요로 하는 Lock을 보유중이면 Deadlock상태가 발생한다.  
-
-해결: 
-해결을 위해서는, Lock을 보유한 기존의 쓰레드의 우선도를 새로 생성된 쓰레드의 우선도까지 올려주어야 한다. 이는 '기부'라는 방식으로 진행되는데 Lock을 필요로 하는 쓰레드의 우선도를 Lock을 보유한 쓰레드의 우선도에 맞춰주는 것이다.  
-이후, Lock이 해제되면 기부받은 쓰레드의 우선도는 기존의 우선도로 원상복구된다.  
-
-구조체:
-```c
-struct thread {
-	/* Owned by thread.c. */
-	tid_t tid;                          /* Thread identifier. */
-	enum thread_status status;          /* Thread state. */
-	char name[16];                      /* Name (for debugging purposes). */
-	int priority;                       /* Priority. */
-	int original_priority;				/* 원래의 우선도(priority)*/
-	int64_t sleep_ticks; 				/* 자고 있는 시간*/
-    bool has_lock;
-}
-```
-다시 기존의 우선도로 돌릴 수 있도록 original_priority 변수를 구조체에 추가해 주었으며, 이는 쓰레드가 thread_create로 만들어지는 시점에 priority 값으로 맞춰진다. 쓰레드의 Lock 보유 상황을 관리할 수 있도록 bool has_lock 또한 추가해주었다. 
-
-```c
-tid_t
-thread_create (const char *name, int priority,
-		thread_func *function, void *aux) {
-	struct thread *t;
-	tid_t tid;
-
-	ASSERT (function != NULL);
-
-	/* Allocate thread. */
-	t = palloc_get_page (PAL_ZERO);
-	if (t == NULL)
-		return TID_ERROR;
-
-	/* Initialize thread. */
-	init_thread (t, name, priority);
-	tid = t->tid = allocate_tid ();
-
-	/* Call the kernel_thread if it scheduled.
-	 * Note) rdi is 1st argument, and rsi is 2nd argument. */
-	t->tf.rip = (uintptr_t) kernel_thread;
-	t->tf.R.rdi = (uint64_t) function;
-	t->tf.R.rsi = (uint64_t) aux;
-	t->tf.ds = SEL_KDSEG;
-	t->tf.es = SEL_KDSEG;
-	t->tf.ss = SEL_KDSEG;
-	t->tf.cs = SEL_KCSEG;
-	t->tf.eflags = FLAG_IF;
-
-	/* Add to run queue. */
-	thread_unblock (t);
-
-	if (thread_get_priority() < priority){
-        if(aux != NULL && thread_current()->has_lock){
-            thread_current()->priority = priority;
-        }
-		thread_yield();		
-	}
-
-	return tid;
-}
-
-```
-기존의 thread_create함수에 더 높은 우선순위가 들어오면 양보하는 부분이다.  
-여기에 양보하기 전, Lock이 있고, 현재 실행되고 있는 낮은 우선도 쓰레드가 Lock을 보유했다면 우선도를 기부받는다.
-
-이후, sema_up에서 현재 쓰레드의 priority가 기존의 original_priority와 다르면 `thread_current()->priority = thread_current()->original_priority;`를 통해  
-우선도를 original priority로 낮춰주었다.  
-
----
-
-priority-donate-multiple & priority-donate-multiple2
-
-문제:
-다수의 lock이 초기화되며 이는 모두 현재 실행되고 있는 main 쓰레드가 보유하고 있다. lock의 개수만큼 쓰레드가 생성되며, 이 때 생성되는 쓰레드는 모두 다른 lock을 필요로 한다. 
-
-Lock a & b가 하나의 저우선도 쓰레드에 묶여있을 떄, a와 b를 필요로 하는 쓰레드 중 더 높은 우선도의 쓰레드의 우선도에 맞춰져 하나의 lock을 release하지만 우선도를 곧바로 원래의 original_priority우선도로 낮춰 두번쨰 lock은 release하지 못한다. 
-
-과정: 
-처음 고안해낸 해결법은 전역으로 선언한 lock_list에 모든 보유중인 lock을 넣고, 구조체 lock에 lock_elem과 lock_priority라는 변수를 만드는 것이었다.  
-lock_acquire에서 lock->lock_priority를 해당 lock을 필요로 하는 모든 쓰레드들 중 가장 높은 우선도로 맞춰주고, 
-lock_list에 우리가 원하는 lock이 있다면 그 lock의 holder 쓰레드의 우선도를 lock_priority로 올려주는 것이었다.  
-
-여기에 기반해서 매 번 조금씩 사소한 변경들을 했지만 Kernel Panic과 Pintos Booting/Boot Complete메시지 누락 등의 오류에 부딛혔다. 
-
-
-해결:
-쓰레드 구조체에 기부자 명단 리스트 donors와 현재 필요한(하지만 다른 쓰레드갑 보유하고 있는) lock wait_on_lock을 추가했다. 
-
-```c
-struct thread {
-	/* Owned by thread.c. */
-	tid_t tid;                          /* Thread identifier. */
-	enum thread_status status;          /* Thread state. */
-	char name[16];                      /* Name (for debugging purposes). */
-	int priority;                       /* Priority. */
-	int original_priority;				/* 원래의 우선도(priority)*/
-	int64_t sleep_ticks; 				/* 자고 있는 시간*/
-	int has_lock;
-	/* Shared between thread.c and synch.c. */
-	struct list_elem elem;              /* List element. */
-	struct list_elem donor_elem;
-	struct list donors;					/* 해당 쓰레드에 기부한 목록*/
-	struct lock *wait_on_lock;			/* 이 락이 없어서 못 가고 있을 때*/
-}
-```
-우선, thread_create함수에서 lock정보를 aux를 사용해 받아오는 부분을 삭제했다. 
-```c
-	if (thread_get_priority() < priority){
-		thread_yield();		
-	}
-```
-
-이후, lock_acquire함수와 lock_release함수를 변경했다. 
-
-```c
-void
-lock_acquire (struct lock *lock) {
-	ASSERT (lock != NULL);
-	ASSERT (!intr_context ());
-	ASSERT (!lock_held_by_current_thread (lock));
-
-	struct thread *lock_holder;
-	struct thread *now = thread_current();
-	
-	/* 추가 구현한 부분 */
-	if (lock->holder != NULL)
-	{
-		lock_holder = lock->holder;
-		now->wait_on_lock = lock;
-		if (now->priority> lock_holder->priority)
-		{
-			list_insert_ordered(&lock_holder->donors, &now->donor_elem, lock_priority, NULL);
-			now->wait_on_lock->holder->priority = now->priority;
-		}
-	}
-	/*                   */
-
-	sema_down (&lock->semaphore);
-	thread_current()->wait_on_lock = NULL;
-	lock->holder = thread_current ();
-}
-```
-기존 함수에서 새로운 부분을 추가했는데, 이 부분에서 현재 쓰레드의 우선도와 lock holder의 우선도를 비교하여, 현재 쓰레드의 우선도가 적을 시 lock holder를 현재 쓰레드의 donors 명단에 삽입해주고, lock holder의 우선도를 현재 쓰레드(lock이 필요한 쓰레드)의 우선도로 올려주었다.  
-
-```c
-void
-lock_release (struct lock *lock) {
-	ASSERT (lock != NULL);
-	ASSERT (lock_held_by_current_thread (lock));
-
-	/* 추가 구현한 부분 */
-	if (!list_empty(&lock->holder->donors)){
-
-		struct list_elem *element;
-		element = list_front(&lock->holder->donors);
-		
-		while(element != NULL){	
-			struct thread *t = list_entry(element, struct thread, donor_elem);
-			if (t->wait_on_lock == lock){
-				list_remove(element);
-				break;
-			}
-
-			element = element->next;
-			if (element->next == NULL){
-				break;
-			}
-		}
-	} 
-	
-	if (!list_empty(&thread_current()->donors))
-	{
-		struct thread* foremost_thread = list_entry(list_front(&thread_current()->donors), struct thread, donor_elem);
-		thread_current()->priority = foremost_thread->priority;
-	}
-	else {
-		thread_current()->priority = thread_current()->original_priority;
-	}
-	/*                   */
-
-	lock->holder = NULL;
-	thread_current()->wait_on_lock = NULL;
-	sema_up (&lock->semaphore);
-
-}
-```
-lock_release에서는 release하려는 lock holder의 donors리스트를 확인 후 이를 탐색하며 현재 쓰레드가 필요로 하는 lock의 보유 쓰레드인지 찾고 이를 리스트에서 제거한다.  
-
-이후 반복문을 탈출해 조건문에 따라 추가 기부가 있다면 그 중 가장 우선도가 높은 기부자의 우선도로 현재 쓰레드의 우선도를 조정하고, 없을 시 쓰레드의 원래의 우선도로 조정한다. 
-
-마지막으로, wait_on_lock을 NULL로 변경해주면서 더 이상 기다리고 있는 lock이 없다는 것을 명확하게 해준다. 
-
----
-
-priority-donate-nested & priority-donate-chain
-
-문제: 
-가장 높은 우선도의 쓰레드가 필요로 하는 lock의 보유자가 다른 lock을 기다리고 있을 때  
-이를 순차적으로 release하여 deadlock 상태를 예방해야 한다. 
-
-해결: 
-```c
-/* 재귀형태로 구현한 함수 for nested & chain */
-void donate_recursion(struct thread *t){
-	if(t->priority > t->wait_on_lock->holder->priority)
-		t->wait_on_lock->holder->priority = t->priority;
-	
-	if(t->wait_on_lock->holder->wait_on_lock != NULL){
-		donate_recursion(t->wait_on_lock->holder);
-	}
-}
-
-void
-lock_acquire (struct lock *lock){
-    //
-    //
-	//
-	//
-   
-   	if (lock->holder != NULL)
-	{
-		lock_holder = lock->holder;
-		now->wait_on_lock = lock;
-		/* check 2 */
-		if (now->priority> lock_holder->priority)
-		{
-			list_insert_ordered(&lock_holder->donors, &now->donor_elem, lock_priority, NULL);
-			donate_recursion(now);
-		}
-	}
-
-
-}
-```
-해당 문제는 기존에 구현한 lock_acquire에서의 우선도의 조정 과정을 재귀함수로 해석하여 여러 비슷한 문제를 한 번에 해결하였다.  
-
-donate_recursion 함수에서는 현재 쓰레드가 필요로 하는 lock이 다른 lock을 필요로 하면 연속하여 가장 높은 우선도의 쓰레드로 우선도를 조정하도록 한다. 
-
----
-
-priority-donate-sema
-
-문제:
-가장 낮은 우선도의 쓰레드가 lock을 갖고 있고, 중간에 lock이 필요 없는 중간 우선도의 쓰레드가 생성, 이후 바로 lock을 필요로 하는 가장 높은 우선도의 쓰레드가 생성이 될 때 순차적으로 해결해야 한다. 
-
-해결: 
-기존에 구현했던 방식들이 유기적으로 작동하여 해결되었다.
-더 높은 우선도의 쓰레드가 들어올 시 양보하는 구조, lock이 필요할 시 lock holder의 우선도를 높이는 것과 release이후 도로 낮추는 구조 등이 해당 문제의 해결에 작용하였다.  
-
----
-
-priority-donate-lower
-
-문제: 
-lock holder 쓰레드가 기부를 받아 우선도가 올라간 상태에서 우선도가 thread_set_priority를 통해 설정되면, 기부가 사라진 상태에서 이 set된 우선도로 돌아가도록 해야한다.  
-
-해결: 
-현재 기부 받은 상태면 priority를 변경하지 않도록 조건문을 추가하였고, 함수를 통해 설정된 우선도를 저장하기 위해 기존에 thread 구조체에 만들었던 original_priority 변수를 설정해주었다.   
-
-```c
-void
-thread_set_priority (int new_priority) {
-	/* priority-lower */
-	if (thread_current()->priority == thread_current()->original_priority){
-		thread_current ()->priority = new_priority;
-	} 
-
-	thread_current()->original_priority = new_priority;
-
-	//새 priority가 더 낮은지 확인
-	//Ready List에 더 높은 우선순위가 있다면 양보
-	struct list_elem *max_elem = list_max(&ready_list, priority_scheduling, NULL);
-	struct thread *next = list_entry(max_elem, struct thread, elem);
-	if (thread_get_priority() < next->priority){
-
-		thread_yield();	
-	}
-}
-```
----
-
-priority-fifo & priority-preempt & priority-sema
-
-문제: 
-FIFO: 같은 우선순위일 때 들어온 순서로 해결되도록 해야한다. 
-PREEMPT: 높은 우선도의 쓰레드가 실제로 선점하는지 확인해야한다. 
-SEMA: sema->waiters리스트에서 높은 우선도의 순서로 나오도록 해야한다. 
-
-해결: 
-기존에 구현했던 개념들이 유기적으로 작용하여 위 세 문제는 이미 처리되었다. 
-
----
-
-priority-condvar
-
-문제:
-
-
-해결:
-synch.c 중간에 숨어있던 semaphore_elem이라는 구조체를 활용하고자 했다.  
-여기에 우선도를 저장해줄 변수 sema_priority를 추가하여, 이를 사용해 policy에 따라 리스트에 정렬되도록 했다. 
-
-```c
-struct semaphore_elem {
-	struct list_elem elem;              /* List element. */
-	struct semaphore semaphore;         /* This semaphore. */
-	int sema_priority;
+// 보조 페이지 테이블 구조체 
+struct supplemental_page_table  
+{
+    struct hash hash_table;
 };
 
-static bool sema_elem_priority(const struct list_elem *a_, const struct list_elem *b_,
-            void *aux UNUSED){
-	struct semaphore_elem *a = list_entry (a_, struct semaphore_elem, elem);
-	struct semaphore_elem *b = list_entry (b_, struct semaphore_elem, elem);
-
-	return (a->sema_priority > b->sema_priority);
-}
-
-void
-cond_wait (struct condition *cond, struct lock *lock) {
-	struct semaphore_elem waiter;
-	waiter.sema_priority = NULL;
-
-	ASSERT (cond != NULL);
-	ASSERT (lock != NULL);
-	ASSERT (!intr_context ());
-	ASSERT (lock_held_by_current_thread (lock));
-
-	sema_init (&waiter.semaphore, 0);
-	/* 추가 구현한 부분 */
-	waiter.sema_priority = thread_current()->priority;
-	list_insert_ordered (&cond->waiters, &waiter.elem, sema_elem_priority, NULL);
-	/*                 */
-	lock_release (lock);
-	sema_down (&waiter.semaphore);
-	lock_acquire (lock);
-
-}
-
-
-```
-기존에 있던 정렬 정책들과 비슷하지만, elem이 속해있는 원 구조체가 semaphore_elem이기 때문에 이 형태로 찾아주고, 앞서 만든 sema_priority를 비교하여 cond->waiters리스트에 정렬된 상태로 삽입했다. 
-
----
-
-mlfqs-load-1
-
-문제: 
-mlfqs에 대한 함수들의 프레임만 존재해서 함수들을 구현해야 했고, 
-부동소수점을 사용할 수 없기에, 실수연산을 모두 고정소수점을 사용해서 해결해 주어야 했다.
-
-
-해결:
-부동소수점이 들어가는 연산을 고정소수점으로 바꾸는 #define 매크로를 사용해서 해결해주었다.
-시스템이 얼마나 바쁜지 알려주는 thread_get_load_avg() 과 update_load_avg() 함수를 구현해주었다.
-
-```c
-#define P 17
-#define Q 14
-#define F (1 << (Q))
-
-#define FIXED_POINT(x) (x) * (F)
-#define REAL_NUMBER(x) (x) / (F)
-
-#define ROUND_TO_INT(x) (x >= 0 ? ((x + F / 2) /F) : ((x - F / 2 ) /F))
-
-//고정소수점 기본 연산
-#define ADD_FIXED(x,y) (x) + (y)
-#define SUB_FIXED(x,y) (x) - (y)
-#define MUL_FIXED(x,y) ((int64_t)(x)) * (y) / (F)
-#define DIV_FIXED(x,y) ((int64_t)(x)) * (F) / (y)
-
-#define ADD_INT(x, n) (x) + (n) * (F)
-#define SUB_INT(x, n) (x) - (n) * (F)
-#define MUL_INT(x, n) (x) * (n)
-#define DIV_INT(x, n) (x) / (n)
-
-void 
-update_load_avg(){
-	ASSERT(thread_mlfqs == true)
-	int ready = list_size(&ready_list);;
-	struct thread* t = thread_current();
-
-	if (t != idle_thread)
-		ready ++;
-
-	load_avg = ADD_FIXED(MUL_FIXED(DIV_INT(FIXED_POINT(59), 60), load_avg),MUL_INT(DIV_INT(F,60),ready));
-}
-
-/* Returns 100 times the system load average. */
-int
-thread_get_load_avg (void) {
-	ASSERT(thread_mlfqs == true)
-	
-	int return_load_avg = ROUND_TO_INT(MUL_INT((load_avg), 100));
-	
-	return return_load_avg;
-}
-
-```
-
----
-
-mlfqs-load-60 & mlfqs-load-avg
-
-문제:
-여러개의 쓰레드가 생성되고, nice값과 recent_cpu 값을 통해서 
-쓰레드들의 load-avg값이 바뀌어야 했다.
-
-사건?:
-mlfqs-load-60의 경우 큰 문제 없이 해결이 되었는데, 
-mlfqs-load-avg의 경우 5시간 이상의 많은 시간을 잡아먹었다.
-문제를 못찾겠어서 여러 코드를 다 뜯어보다가, 
-결국 #define 매크로에서 문제가 생겼다는 것을 찾아낼 수 있었다.
-
-해결:
-전역변수 all_list와 쓰레드 구조체에 nice_vale와 recent_cpu, all_elem을 만들어주고,
-nice 갱신 함수를 구현하여 해결하였다.
-
-
----
-
-mlfqs-recent-1
-
-매우 까다로웠으며, 사실 아직도 모르는 부분이 많다고 생각한다. 
-우선, 인터럽트때마다 쓰레드의 recent cpu 값을 올려야 했으며, 매 초마다 recent_cpu값을 새로 계산해주어야 했다. 
-
-여기에서는 구한 load_avg값을 사용해야 했기 때문에 매 초 갱신한 load_avg 아래에 함수 호출을 해주었다. 
-
-다만, calc_all_recent_cpu() 함수를 사용하면 load-60가 실패하며, 해당 문제는 결국 해결하지 못했다. 
-
-```c
-struct thread {
-	/* Owned by thread.c. */
-	tid_t tid;                          /* Thread identifier. */
-	enum thread_status status;          /* Thread state. */
-	char name[16];                      /* Name (for debugging purposes). */
-	int priority;                       /* Priority. */
-	int original_priority;				/* 원래의 우선도(priority)*/
-	int64_t sleep_ticks; 				/* 자고 있는 시간*/
-	int has_lock;
-	/* Shared between thread.c and synch.c. */
-	struct list_elem elem;              /* List element. */
-	struct list_elem donor_elem;
-
-	struct list donors;					/* 해당 쓰레드에 기부한 목록*/
-	struct lock *wait_on_lock;			/* 이 락이 없어서 못 가고 있을 때*/
-	/* 추가 구현한 부분 */
-	int nice_value;
-	int recent_cpu;
-	struct list_elem all_elem;
-
-void
-thread_set_nice (int nice) {
-	ASSERT(thread_mlfqs == true)
-
-	thread_current()->nice_value = nice;
-	int new_priority = calculate_advanced_priority(thread_current());
-
-	thread_set_priority(new_priority);
-
-}
-
-/* Returns the current thread's nice value. */
-int
-thread_get_nice (void) {
-	ASSERT(thread_mlfqs == true)
-
-	return thread_current()->nice_value;
-}
-
-
-int
-calculating_recent_cpu(struct thread* t){
-	
-	ASSERT(thread_mlfqs == true);
-
-	int recent = t->recent_cpu;
-	recent = ADD_INT(MUL_FIXED(DIV_FIXED(MUL_INT(load_avg, 2), ADD_INT(MUL_INT(load_avg, 2),1)),recent),t->nice_value);
-
-	t->recent_cpu = recent;
-
-	return recent;
-}
-
-void calc_all_recent_cpu(){
-	if (list_empty(&all_list))
-		return;
-	
-	struct list_elem*e = list_front(&all_list);
-	struct thread *t;
-	for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e)){
-		t = list_entry(e, struct thread, all_elem);
-		t->recent_cpu = calculating_recent_cpu(t);
-	}	
+void supplemental_page_table_init(struct supplemental_page_table *spt UNUSED)
+{
+    hash_init(&spt->hash_table, page_hash, page_less, NULL);
 }
 ```
 
+해시 테이블을 구현할 때는 hash.h를 참조하여 구현했다.
 
+```
+struct page *spt_find_page(struct supplemental_page_table *spt, void *va)
+{
+    struct page *page = NULL;
+    struct hash *hash = &spt->hash_table;
+
+    page = (struct page *)malloc(sizeof(struct page));
+    page->va = pg_round_down(va);
+    struct hash_elem *e = hash_find(hash, &page->h_elem);
+    free(page);
+    if (e == NULL)
+    {
+        return NULL;
+    }
+    page = hash_entry(e, struct page, h_elem);
+    return page;
+}
+```
+
+이 코드를 구현할 때 어려움이 있었다.  
+hash\_find() 할 때 페이지의 &page->h\_elem을 사용하는데 저 페이지는 위에서 방금 할당한 페이지이다.  
+그런데 왜 해시에서 찾아질까? 하는 의문이 있었다.  
+조교님께 질문을 했고 답을 얻을 수 있었다.
+
+[##_Image|kage@LCVWd/btsGjZ1f0lh/8WSgc5WjZKiC1ILUcCixX0/img.png|CDM|1.3|{"originWidth":657,"originHeight":429,"style":"alignCenter"}_##]
+
+**pg\_round\_down()를 사용한 이유**  
+va가 가리키는 가상 페이지의 시작을 가리켜야 코드 진행 중 다른 페이지의 영역을 침범하지 않는다.
+
+---
+
+```
+bool spt_insert_page(struct supplemental_page_table *spt UNUSED,struct page *page UNUSED)
+{
+    int succ = false;
+    struct hash *hash = &spt->hash_table;
+
+    if (hash_insert(hash, &page->h_elem) != NULL)
+    {
+        return succ;
+    }
+
+    succ = true;
+    return succ;
+}
+
+void spt_remove_page(struct supplemental_page_table *spt, struct page *page)
+{
+    hash_delete(&spt->hash_table, &page->h_elem);
+    vm_dealloc_page(page);
+    return true;
+}
+```
+
+보조 페이지 테이블의 삽입과 삭제를 위한 함수
+
+---
+
+## 프레임
+
+```
+struct frame // 프레임 구조체 
+{
+    void *kva;
+    struct page *page;
+    struct list_elem f_elem;
+};
+```
+
+프레임 테이블을 위해 list\_elem을 추가해줬다.
+
+```
+static struct frame *vm_get_frame(void)
+{
+    struct frame *frame = NULL; // 정적 선언
+    void *kva;
+    struct page *page = NULL;
+
+    kva = palloc_get_page(PAL_USER);
+    if (kva == NULL)
+    {
+        struct frame *victim = vm_evict_frame(); // 페이지 교체 정책
+        victim->page = NULL;
+        return victim;
+    }
+
+    frame = (struct frame *)malloc(sizeof(struct frame));
+    frame->kva = kva;
+    frame->page = page;
+
+    lock_acquire(&vm_lock);
+    list_push_back(&frame_table, &frame->f_elem);
+    lock_release(&vm_lock);
+
+    ASSERT(frame != NULL);
+    ASSERT(frame->page == NULL);
+    return frame;
+}
+```
+
+페이지에 할당해 줄 프레임을 반환해 주는 함수다.  
+kva = palloc\_get\_page(PAL\_USER)은 커널 영역에 있는 유저 스택의 메모리를 가져온다.  
+kva가 NULL이라면 물리 주소에 더 이상 공간이 없기 때문에 페이지 교체 정책을 실행해 준다.  
+kva가 NULL이 아니라면 물리 주소와 프레임을 매핑시켜 주고 프레임 테이블에 삽입해 준다.  
+이때 동시성 문제를 고려하여 lock을 사용해 주었다.
+
+---
+
+```
+bool vm_claim_page(void *va UNUSED)
+{
+    struct page *page = NULL;
+    struct supplemental_page_table *spt = &thread_current()->spt;
+
+    page = spt_find_page(spt, va);
+    if (page == NULL)
+        return false;
+
+    return vm_do_claim_page(page);
+}
+
+/* Claim the PAGE and set up the mmu. */
+static bool vm_do_claim_page(struct page *page)
+{
+    struct frame *frame = vm_get_frame();
+
+    frame->page = page;
+    page->frame = frame;
+
+    struct thread *cur = thread_current();
+    pml4_set_page(cur->pml4, page->va, frame->kva, page->writable);
+
+
+    return swap_in(page, frame->kva);
+}
+```
+
+페이지와 프레임을 매핑해 주는 함수  
+보조 페이지 테이블에서 va에 해당하는 페이지를 찾아 vm\_do\_claim\_page()를 호출한다.  
+vm\_do\_claim\_page()에서 vm\_get\_frame()으로 프레임을 할당받고 페이지와 프레임을 매핑시켜 준다.  
+실제 페이지 테이블에도 마찬가지로 매핑시켜 준다. 이후 swap\_in()을 호출한다.
+
+---
+
+```
+bool vm_alloc_page_with_initializer(enum vm_type type, void *upage, bool writable, vm_initializer *init, void *aux)
+{
+    ASSERT(VM_TYPE(type) != VM_UNINIT)
+
+    struct supplemental_page_table *spt = &thread_current()->spt;
+
+    if (spt_find_page(spt, upage) == NULL)
+    {
+
+        struct page *new_page = (struct page *)malloc(sizeof(struct page)); 
+
+        if (VM_TYPE(type) == VM_ANON)
+        {
+            uninit_new(new_page, upage, init, type, aux, anon_initializer);
+        }
+        else if (VM_TYPE(type) == VM_FILE)
+        {
+            uninit_new(new_page, upage, init, type, aux, file_backed_initializer);
+        }
+        new_page->writable = writable;
+ 
+        return spt_insert_page(spt, new_page);
+    }
+err:
+    return false;
+}
+```
+
+페이지 타입에 따라 새로운 페이지를 할당해주는 함수이다.
+
+uninit 타입의 페이지를 먼저 만들어서 보조 페이지 테이블에 삽입하는 함수이다.  
+페이지가 변화할 타입에 따라 다른 initializer 함수를 사용한다.
+
+---
+
+아래 코드를 설명하기 전 Lazy loading에 대해 알아야 한다.  
+Lazy loading 이란 프로그램이 실제로 해당 데이터를 필요로 할 때까지 데이터의 로딩을 지연시키는 기법.
+
+```
+static bool load_segment(struct file *file, off_t ofs, uint8_t *upage, uint32_t read_bytes, uint32_t zero_bytes, bool writable)
+{
+    ASSERT((read_bytes + zero_bytes) % PGSIZE == 0);
+    ASSERT(pg_ofs(upage) == 0);
+    ASSERT(ofs % PGSIZE == 0);
+
+    while (read_bytes > 0 || zero_bytes > 0)
+    {
+        size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+        size_t page_zero_bytes = PGSIZE - page_read_bytes;
+
+        void *aux = NULL;
+
+        struct necessary_info *nec = (struct necessary_info *)malloc(sizeof(struct necessary_info));
+        nec->file = file;
+        nec->ofs = ofs;
+        nec->read_byte = page_read_bytes;
+        nec->zero_byte = page_zero_bytes;
+        aux = nec;
+
+        if (!vm_alloc_page_with_initializer(VM_ANON, upage,
+                                            writable, lazy_load_segment, aux))
+            return false;
+        /* Advance. */
+        read_bytes -= page_read_bytes;
+        zero_bytes -= page_zero_bytes;
+        upage += PGSIZE;
+        ofs += page_read_bytes;
+    }
+    return true;
+}
+
+bool lazy_load_segment(struct page *page, void *aux)
+{
+    struct necessary_info *nec = (struct necessary_info *)aux;
+
+    void *kpage = page->frame->kva;
+
+    file_seek(nec->file, nec->ofs);
+
+    if (file_read(nec->file, kpage, nec->read_byte) != (int)nec->read_byte)
+    {
+        palloc_free_page(kpage);
+        printf("file read fail read byte %d\n", nec->read_byte);
+        return false;
+    }
+    memset(kpage + nec->read_byte, 0, nec->zero_byte);
+    file_seek(nec->file, nec->ofs);
+    return true;
+}
+```
+
+load\_segment()는 lazy\_load\_segment()를 위한 전처리 작업을 해준다.  
+lazy\_load\_segment()에서 필요한 정보들을 보조 구조체인 necessary\_info에 담아 aux 형태로 전달한다.
+
+lazy\_load\_segment()는 실제로 페이지의 데이터를 복사하는 함수이다.  
+demand zero memory를 위해 memset()로 0으로 세팅해 주었다.
+
+---
+
+```
+bool supplemental_page_table_copy(struct supplemental_page_table *dst UNUSED, struct supplemental_page_table *src UNUSED)
+{
+    struct hash *src_hash = &src->hash_table;
+    struct hash *dst_hash = &dst->hash_table;
+    struct hash_iterator i;
+
+    hash_first(&i, src_hash);
+    while (hash_next(&i))
+    {
+        struct page *p = hash_entry(hash_cur(&i), struct page, h_elem);
+        if (p == NULL)
+            return false;
+        enum vm_type type = page_get_type(p);
+        struct page *child;
+
+        if (p->operations->type == VM_UNINIT)
+        {
+            if (!vm_alloc_page_with_initializer(type, p->va, p->writable, p->uninit.init, p->uninit.aux))
+                return false;
+        }
+        else
+        {
+            if (!vm_alloc_page(type, p->va, p->writable))
+                return false;
+            if (!vm_claim_page(p->va))
+                return false;
+
+            child = spt_find_page(dst, p->va);
+            memcpy(child->frame->kva, p->frame->kva, PGSIZE);
+        }
+    }
+
+    return true;
+}
+
+void hash_elem_destroy(struct hash_elem *e, void *aux UNUSED)
+{
+    struct page *p = hash_entry(e, struct page, h_elem);
+    vm_dealloc_page(p);
+}
+/* Free the resource hold by the supplemental page table */
+void supplemental_page_table_kill(struct supplemental_page_table *spt UNUSED)
+{
+
+    struct hash *hash = &spt->hash_table;
+    hash_clear(hash, hash_elem_destroy);
+}
+```
+
+supplemental\_page\_table\_copy()와 supplemental\_page\_table\_kill()은 부모가 자식에게 보조 페이지 테이블 전달과 삭제를 위해 사용된다.
+
+supplemental\_page\_table\_copy()는 자식을 위한 페이지를 할당받고 물리 메모리를 매핑한 후 부모의 물리 주소안에 있는 데이터를 자식에게 복사한다.
+
+supplemental\_page\_table\_kill()은 보조 페이지 테이블에 있는 페이지들을 삭제하는 함수이다.  
+hash\_clear()에는 보조 해시 함수가 필요한데 hash\_elem\_destroy()을 만들어주었다.
+
+---
+
+## Stack Growth
+
+setup\_stack()에서 PGSIZE만큼만 할당해 주었기 때문에 그 이상을 사용하기 위해서 vm\_stack\_growth()을 사용해 주어야 한다. 메모리 효율을 위해 필요할 때마다 vm\_stack\_growth() 사용하여 스택을 늘려주어야 한다.
+
+```
+bool vm_try_handle_fault(struct intr_frame *f UNUSED, void *addr UNUSED, bool user UNUSED, bool write UNUSED, bool not_present UNUSED)
+{
+    struct supplemental_page_table *spt UNUSED = &thread_current()->spt;
+    struct page *page = NULL;
+    if (is_kernel_vaddr(addr))
+    {
+        return false;
+    }
+    if (addr == NULL)
+    {
+        return false;
+    }
+
+    if (not_present)
+    {
+        void *rsp;
+        if (user)
+            rsp = f->rsp;
+        else
+            rsp = thread_current()->rsp_stack;
+
+        if (rsp - 8 <= addr && USER_STACK - 0x100000 <= rsp - 8 && addr <= USER_STACK)
+        {
+            vm_stack_growth(pg_round_down(addr));
+        }
+
+        page = spt_find_page(spt, addr);
+
+        if (page == NULL)
+        {
+            return false;
+        }
+        if (write == 1 && page->writable == 0)
+            return false;
+        return vm_do_claim_page(page);
+    }
+
+    return false;
+}
+```
+
+페이지 폴트 발생 시 exception.c에서 호출하는 핸들러다.
+
+rsp보다 위에서 일어난 페이지 폴트만 유효한 접근이다.  
+유저 스택의 크기가 1MB를 넘어선 안된다.  
+이러한 조건들이 만족할 시 vm\_stack\_growth()을 호출한다.  
+해당 페이지가 보조 페이지 테이블에 있을 때 물리 메모리를 할당해 준다.
+
+```
+static void vm_stack_growth(void *addr)
+{
+    vm_alloc_page(VM_ANON | VM_MARKER_0, pg_round_down(addr), 1);
+}
+```
+
+새롭게 스택에 페이지를 할당해 준다.
+
+---
+
+## Memory Mapped Files
+
+```
+void *mmap(void *addr, size_t length, int writable, int fd, off_t offset)
+{
+    // 파일의 시작점(offset)이 page-align되지 않았을 때
+    if (offset % PGSIZE != 0)
+    {
+        return NULL;
+    }
+    // 가상 유저 page 시작 주소가 page-align되어있지 않을 때
+    /* failure case 2: 해당 주소의 시작점이 page-align되어 있는지 & user 영역인지 & 주소값이 null인지 & length가 0이하인지*/
+    if (pg_round_down(addr) != addr || is_kernel_vaddr(addr) || addr == NULL || (long long)length <= 0)
+    {
+        return NULL;
+    }
+    // 매핑하려는 페이지가 이미 존재하는 페이지와 겹칠 때(==SPT에 존재하는 페이지일 때)
+    if (spt_find_page(&thread_current()->spt, addr))
+    {
+        return NULL;
+    }
+
+    // 콘솔 입출력과 연관된 파일 디스크립터 값(0: STDIN, 1:STDOUT)일 때
+    if (fd == 0 || fd == 1)
+    {
+        exit(-1);
+    }
+    // 찾는 파일이 디스크에 없는경우
+    struct file *target = find_file_descriptor(fd)->file;
+    if (target == NULL)
+    {
+        return NULL;
+    }
+
+    return do_mmap(addr, length, writable, target, offset);
+}
+```
+
+syscall.c에 있는 mmap()이다.
+
+do\_mmap() 호출하기 위해 다양한 예외 처리를 거쳤다.
+
+```
+void *do_mmap(void *addr, size_t length, int writable, struct file *file, off_t offset)
+{
+    // offset ~ length
+    void *ret = addr;
+    struct file *open_file = file_reopen(file);
+
+    if (open_file == NULL)
+        return NULL;
+
+    size_t read_byte = file_length(file) < length ? file_length(file) : length;
+    size_t zero_byte = PGSIZE - read_byte % PGSIZE;
+
+    ASSERT((read_byte + zero_byte) % PGSIZE == 0);
+    ASSERT(pg_ofs(addr) == 0);
+    ASSERT(offset % PGSIZE == 0);
+
+    while (read_byte > 0 || zero_byte > 0)
+    {
+        size_t page_read_bytes = read_byte < PGSIZE ? read_byte : PGSIZE;
+        size_t page_zero_bytes = PGSIZE - page_read_bytes;
+
+        struct necessary_info *nec = (struct necessary_info *)malloc(sizeof(struct necessary_info));
+        nec->file = open_file;
+        nec->ofs = offset;
+        nec->read_byte = page_read_bytes;
+        nec->zero_byte = page_zero_bytes;
+
+        if (!vm_alloc_page_with_initializer(VM_FILE, addr, writable, lazy_load_segment, nec))
+            return NULL;
+
+        read_byte -= page_read_bytes;
+        zero_byte -= page_zero_bytes;
+        addr += PGSIZE;
+        offset += page_read_bytes;
+    }
+
+    return ret;
+}
+```
+
+파일의 내용을 페이지로 매핑해주는 함수이다.  
+file\_open()이 아닌 file\_reopen()을 사용한 이유는 file\_close 시에 문제가 생길 수 있기 때문에 독립적인 참조를 위해서 사용해 주었다.
+
+파일의 내용을 페이지에 매핑해주는 함수이기 때문에 load\_segement()와 유사한 구조를 지닌다.
+
+```
+void do_munmap(void *addr)
+{
+    while (true)
+    {
+        struct thread *curr = thread_current();
+        struct page *find_page = spt_find_page(&curr->spt, addr);
+
+        if (find_page == NULL)
+        {
+            return NULL;
+        }
+
+        struct necessary_info *nec = (struct necessary_info *)find_page->uninit.aux;
+        find_page->file.aux = nec;
+        file_backed_destroy(find_page);
+
+        addr += PGSIZE;
+    }
+}
+```
+
+mmap한 주소에 대해 메모리 해제를 진행한다.  
+file\_backed\_destroy()을 호출해 준다.
+
+```
+static void file_backed_destroy(struct page *page)
+{
+    struct file_page *file_page UNUSED = &page->file;
+    struct necessary_info *nec = file_page->aux;
+    struct thread *curr = thread_current();
+
+    if (pml4_is_dirty(curr->pml4, page->va))
+    {
+        file_write_at(nec->file, page->va, nec->read_byte, nec->ofs);
+        pml4_set_dirty(curr->pml4, page->va, 0);
+    }
+    pml4_clear_page(curr->pml4, page->va);
+}
+```
+
+파일이 변경되었다면 변경 사항을 파일에 적용시켜주고 dirty 비트를 세팅한다. 그 이후에 pml4의 페이지를 unmapping 해준다.
+
+---
+
+## Swap In/Out
+
+가상 메모리의 핵심 기법이다.  
+실제 물리 메모리보다 더 큰 것처럼 메모리를 사용하기 위해서 Swap In/Out을 활용한다.
+
+```
+void vm_anon_init(void)
+{
+    hash_init(&swap_table, anon_page_hash, anon_page_less, NULL);
+    lock_init(&swap_lock);
+    swap_disk = disk_get(1, 1); 
+
+    disk_sector_t swap_size = disk_size(swap_disk) / 8;
+    for (disk_sector_t i = 0; i < swap_size; i++)
+    {
+        struct slot *insert_disk = (struct slot *)malloc(sizeof(struct slot));
+        insert_disk->used = 0;
+        insert_disk->index = i;
+        insert_disk->page = NULL;
+        lock_acquire(&swap_lock);
+        hash_insert(&swap_table, &insert_disk->swap_elem);
+        lock_release(&swap_lock);
+    }
+}
+```
+
+anon system을 초기화해주는 함수이다.  
+스왑 테이블 관리를 여러 자료 구조로 사용할 수 있지만 우리는 해시 테이블을 선택했다!
+
+disk\_get()을 통해 스왑 디스크를 할당받았다.  
+disk\_get()의 인자에 따라 디스크의 용도가 정해진다.
+
+> Pintos uses disks this way:  
+> 0:0 - boot loader, command line args, and operating system kernel  
+> 0:1 - file system  
+> 1:0 - scratch  
+> 1:1 - swap
+
+스왑 디스크를 사용하기 위해서 슬롯을 만드는 과정이 필요하다.  
+disk\_sector\_t swap\_size = disk\_size(swap\_disk) / 8; 이 부분에서 8로 나눈 이유는  
+한 슬롯이 한 페이지 담아야 하는데 한 섹터는 512바이트여서 한 섹터가 한 페이지를 담지 못한다. 이러한 이유로 8로 나눠서 8섹터가 1슬롯이 될 수 있게 스왑 사이즈를 조정했다.
+
+```
+struct slot //슬롯 구조체
+{
+    struct hash_elem swap_elem;
+    int used; // 사용중 1, 사용가능 0
+    int index;
+    struct page *page;
+};
+```
+
+각 슬롯은 페이지를 담을 수 있고 고유한 인덱스를 가질 수 있다.
+
+---
+
+```
+bool anon_initializer(struct page *page, enum vm_type type, void *kva)
+{
+    /* Set up the handler */
+    page->operations = &anon_ops;
+
+    struct anon_page *anon_page = &page->anon;
+
+    anon_page->slot_idx = -1;
+
+    return true;
+}
+```
+
+anon\_page->slot\_idx = -1; 슬롯에 저장되지 않은 anon\_page의 인덱스를 -1로 초기화해준다.
+
+---
+
+```
+static bool anon_swap_out(struct page *page)
+{
+    if (page == NULL)
+        return false;
+    struct anon_page *anon_page = &page->anon;
+    struct slot *slot;
+    struct hash_iterator i;
+    hash_first(&i, &swap_table);
+    lock_acquire(&swap_lock);
+    while (hash_next(&i))
+    {
+        slot = hash_entry(hash_cur(&i), struct slot, swap_elem);
+        if (slot->used == 0)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                disk_write(swap_disk, slot->index * 8 + i, page->va + DISK_SECTOR_SIZE * i);
+            }
+
+            anon_page->slot_idx = slot->index;
+            slot->page = page;
+            slot->used = 1;
+            page->frame->page = NULL;
+            page->frame = NULL;
+            pml4_clear_page(thread_current()->pml4, page->va);
+            lock_release(&swap_lock);
+            return true;
+        }
+    }
+    lock_release(&swap_lock);
+    PANIC("full swap disk");
+}
+```
+
+스왑 디스크로 희생 페이지를 내보내는 함수이다.
+
+반복문을 통해 해시 테이블에서 사용 가능한 슬롯을 찾는다. if (slot->used == 0)일 때 디스크에 페이지의 내용을 적어준다. used를 1로 갱신해 준다.  
+나중에 swap in을 대비해서 어떤 슬롯에 내 정보가 저장되어 있는지를 확인하기 위해 아래 코드를 작성했다.
+
+```
+anon_page->slot_idx = slot->index;
+```
+
+페이지와 연결된 프레임을 해제하고 pml4에서도 unmapping 해준다.
+
+동시성 문제를 고려하여 lock을 사용해 주었다.
+
+---
+
+```
+static bool anon_swap_in(struct page *page, void *kva)
+{
+    struct anon_page *anon_page = &page->anon;
+    struct slot *slot;
+    disk_sector_t page_slot_index = anon_page->slot_idx;
+
+    struct hash_iterator i;
+    hash_first(&i, &swap_table);
+    lock_acquire(&swap_lock);
+    while (hash_next(&i))
+    {
+        slot = hash_entry(hash_cur(&i), struct slot, swap_elem);
+        if (slot->index == page_slot_index)
+        {
+            for (int i = 0; i < 8; i++)
+                disk_read(swap_disk, page_slot_index * 8 + i, kva + DISK_SECTOR_SIZE * i);
+
+            slot->page = NULL;
+            slot->used = 0;
+            anon_page->slot_idx = -1;
+            lock_release(&swap_lock);
+            return true;
+        }
+    }
+    lock_release(&swap_lock);
+    return false;
+}
+```
+
+디스크에서 해당 주소로 데이터를 가져오는 함수이다.  
+swap out에서 정해주었던 슬롯의 인덱스와 페이지 슬롯의 인덱스가 동일하다면 disk\_read()를 진행한다.  
+disk\_read() -> page\_slot\_index 8 + i을 사용한 이유는 각 슬롯이 8개의 섹터를 가지고 있기 때문이다. disk\_read() -> kva + DISK\_SECTOR\_SIZE i는 각 섹터의 크기만큼 오프셋을 이동하기 위해 사용했다.
+
+페이지를 swap in했으므로 해당 페이지의 슬롯 인덱스를 -1로 갱신했다.
+
+---
+
+```
+bool file_backed_initializer(struct page *page, enum vm_type type, void *kva)
+{
+    /* Set up the handler */
+    page->operations = &file_ops;
+
+    struct file_page *file_page = &page->file;
+
+    file_page->aux = page->uninit.aux;
+
+    return true;
+}
+```
+
+swap in을 위해서 page->uninit.aux를 file\_page->aux에 받아왔다.
+
+```
+static bool file_backed_swap_out(struct page *page)
+{
+    struct file_page *file_page UNUSED = &page->file;
+    if(page==NULL){
+		return false;
+	}
+    struct necessary_info *nec = file_page->aux;
+    struct file* file = nec->file;
+    lock_acquire(&file_lock);
+    if(pml4_is_dirty(thread_current()->pml4,page->va)){
+		file_write_at(file,page->va, nec->read_byte, nec->ofs);
+		pml4_set_dirty(thread_current()->pml4, page->va, 0);
+	}
+	pml4_clear_page(thread_current()->pml4, page->va);
+    lock_release(&file_lock);
+	return true;
+}
+```
+
+file-backed는 anon과 달리 스왑 디스크가 아니라 파일에 스왑한다.  
+페이지의 내용이 변경된 적이 있다면 변경된 내용을 파일 갱신하고 dirty 비트를 0으로 변경한다.  
+이후 pml4\_clear\_page() 사용했다.
+
+```
+static bool file_backed_swap_in(struct page *page, void *kva)
+{
+    struct file_page *file_page UNUSED = &page->file;
+    struct necessary_info *nec = (struct necessary_info *)file_page->aux;
+
+    file_seek(nec->file, nec->ofs);
+    lock_acquire(&file_lock);
+    file_read(file_page->file, kva, nec->read_byte);
+    lock_release(&file_lock);
+
+    memset(kva + nec->read_byte, 0, nec->zero_byte);
+
+    return true;
+}
+```
+
+file\_seek()를 통해 파일의 오프셋을 변경해 주고 파일에서 물리 메모리로 데이터를 가져온다.  
+이후 memset()을 통해 제로 바이트 영역을 0으로 세팅해 주었다.
+
+---
+
+## 페이지 교체 정책 - Clock
+
+```
+static struct frame *vm_get_victim(void)
+{
+    struct frame *victim = NULL;
+    /* Clock Algorithm */
+    struct list_elem *e;
+    lock_acquire(&vm_lock);
+    for (e = list_begin(&frame_table); e != list_end(&frame_table); e = list_next(e))
+    {
+        victim = list_entry(e, struct frame, f_elem);
+        if (victim->page == NULL)
+        {
+            lock_release(&vm_lock);
+            return victim;
+        }
+        if (pml4_is_accessed(thread_current()->pml4, victim->page->va))
+            pml4_set_accessed(thread_current()->pml4, victim->page->va, 0);
+
+        else
+        {
+            lock_release(&vm_lock);
+            return victim;
+        }
+    }
+    lock_release(&vm_lock);
+    return victim;
+}
+```
+
+Clock 페이지 교체 정책이다.
+
+프레임 테이블을 돌며 희생 페이지가 NULL이면 그 페이지를 바로 반환하고 NULL이 아니면 accessed 비트를 확인한다. accessed 비트가 1이면 0으로 바꿔주고 0이면 그 페이지를 반환한다.
+
+---
+
+# 프로젝트 3 - 트러블 슈팅
+
+### vm\_get\_frame()
+
+vm\_get\_frame()에서 프레임을 반환하는 과정에서 프레임에 메모리 할당을 하지 않았던 문제가 있었다.  
+malloc()을 통해 프레임을 동적 할당해 주었다.
+
+### free() vs palloc\_free\_page()
+
+palloc\_get\_page()로 할당한 메모리를 free()를 통해 해제하려 했기 때문에 문제가 발생했다.
+
+malloc()을 해주면 free()를 해주어야 하고 palloc\_get\_page()를 하면 palloc\_free\_page()를 해주어야 한다. 내부 함수 구조가 다르기 때문에 맞춰주지 않으면 에러가 난다.
+
+### hash function
+
+```
+unsigned anon_page_hash(const struct hash_elem *p_, void *aux UNUSED)
+{
+    const struct slot *p = hash_entry(p_, struct slot, swap_elem);
+    return hash_bytes(&p->index, sizeof p->index);
+}
+
+bool anon_page_less(const struct hash_elem *a_, const struct hash_elem *b_, void *aux UNUSED)
+{
+    const struct slot *a = hash_entry(a_, struct slot, swap_elem);
+    const struct slot *b = hash_entry(b_, struct slot, swap_elem);
+
+    return a->index < b->index;
+}
+```
+
+스왑 테이블에서 사용하는 해시 함수들이다.  
+기존 해시 함수는 page->va를 이용해 해시를 저장한다. 그러나 스왑 테이블에서는 slot->page == NULL 일 수 있기 때문에 함수가 제대로 작동하지 않았다. 그래서 각 슬롯의 고유 인덱스를 통해 해시를 저장할 수 있게 했다.
+
+### syscall read
+
+```
+int read(int fd, void *buffer, unsigned size)
+{
+    if (buffer == NULL || fd < 0 || !is_user_vaddr(buffer))
+        exit(-1);
+    struct page *p = spt_find_page(&thread_current()->spt, buffer);
+
+    off_t buff_size;
+    if (fd == 0)
+    {
+        return input_getc();
+    }
+    else if (fd == NULL || fd == 1)
+    {
+        return -1;
+    }
+    else
+    {
+        struct file_descriptor *read_fd = find_file_descriptor(fd);
+        if (read_fd == NULL)
+            return -1;
+        if (p && !p->writable)
+            exit(-1);
+
+        lock_acquire(&filesys_lock);
+        buff_size = file_read(read_fd->file, buffer, size);
+        lock_release(&filesys_lock);
+    }
+    return buff_size;
+}
+```
+
+```
+    if (p && !p->writable)
+        exit(-1);
+```
+
+위 조건이 필요한 이유는 버퍼에 파일을 읽어온 내용을 저장해야 하기 때문에 p->writable이 0이면 파일 쓰기 권한이 없기 때문에 버퍼에 작성이 불가능하여 오류가 발생했다. 따라서 위 조건을 추가해 주어 문제를 해결했다.
+
+### syscall write
+
+```
+int write(int fd, const void *buffer, unsigned size)
+{
+    if (buffer == NULL || !is_user_vaddr(buffer) || fd < 0)
+        exit(-1);
+    struct page *p = spt_find_page(&thread_current()->spt, buffer);
+    if (p == NULL)
+        exit(-1);
+    if (fd == 1)
+    {
+        putbuf(buffer, size);
+        return size;
+    }
+    else if (fd < 0 || fd == NULL)
+    {
+        exit(-1);
+    }
+    struct file_descriptor *write_fd = find_file_descriptor(fd);
+    if (write_fd == NULL)
+        return -1;
+    // if (p && !p->writable) // 해당 조건 삭제 
+    //     exit(-1);
+    lock_acquire(&filesys_lock);
+    off_t write_size = file_write(write_fd->file, buffer, size); 
+    lock_release(&filesys_lock);
+    return write_size;
+}
+```
+
+write의 경우 위의 read와 다르게 버퍼에 쓰는 것이 아니라 파일에 쓰는 것이 때문에 파일에 대한 쓰기 권한을 확인해 주어야 한다. 이에 맞게 아래 코드로 수정해 주었다.
+
+```
+if (write_fd->file && write_fd->file->deny_write)
+	exit(-1);
+```
+
+### vm\_do\_claim\_page()
+
+-   변경 전 코드
+
+```
+static bool vm_do_claim_page(struct page *page)
+{
+    struct frame *frame = vm_get_frame();
+
+    frame->page = page;
+    page->frame = frame;
+
+    struct thread *cur = thread_current();
+    pml4_set_page(cur->pml4, page->va, frame->kva, page->writable);
+     if (pml4_get_page(cur->pml4, pg_round_down(page->va)) || !pml4_set_page(cur->pml4, pg_round_down(page->va), pg_round_down(frame->kva), page->writable))
+     {
+         return false;
+     }
+
+    return swap_in(page, frame->kva);
+}
+```
+
+-   변경 후 코드
+
+```
+static bool vm_do_claim_page(struct page *page)
+{
+    struct frame *frame = vm_get_frame();
+
+    frame->page = page;
+    page->frame = frame;
+
+    struct thread *cur = thread_current();
+    pml4_set_page(cur->pml4, page->va, frame->kva, page->writable);
+
+
+    return swap_in(page, frame->kva);
+}
+```
+
+lazy loading 때문에 물리 페이지에 할당이 안 되어 있는 상태였다. 그래서 pml4\_get\_page()을 사용하면 오류가 발생했다. 아래 조건 코드를 빼주었다.
+
+```
+pml4_get_page(thread_current()->pml4, buffer) == NULL
+```
+
+### FIFO
+
+```
+static struct frame *
+vm_get_victim(void)
+{
+    struct frame *victim = NULL;
+    /* FIFO */
+    lock_acquire(&vm_lock);
+    struct list_elem *e = list_pop_front(&frame_table);
+    lock_release(&vm_lock);
+    victim = list_entry(e, struct frame, f_elem);
+
+    lock_release(&vm_lock);
+    return victim;
+}
+
+static struct frame *
+vm_evict_frame(void)
+{
+    struct frame *victim UNUSED = vm_get_victim();
+    if (swap_out(victim->page))
+    {
+        list_push_back(&frame_table, &victim->f_elem); // FIFO
+        return victim;
+    }
+
+    return NULL;
+}
+```
+
+원래 구현한 FIFO에서는 프레임 리스트에서 프레임을 삭제했다. 그 결과 프레임 리스트가 빈 상태여서 더 이상 희생 프레임을 가져오지 못하는 오류가 발생했다.  
+해결책으로 swap\_out() 이후 아래 코드를 추가해 주었다.
+
+```
+list_push_back(&frame_table, &victim->f_elem); // FIFO
+```
+
+### memset()
+
+```
+static bool file_backed_swap_in(struct page *page, void *kva)
+{
+    struct file_page *file_page UNUSED = &page->file;
+    struct necessary_info *nec = (struct necessary_info *)file_page->aux;
+
+    file_seek(nec->file, nec->ofs);
+    lock_acquire(&file_lock);
+    file_read(file_page->file, kva, nec->read_byte);
+    lock_release(&file_lock);
+
+    memset(kva + nec->read_byte, 0, nec->zero_byte);
+
+    return true;
+}
+```
