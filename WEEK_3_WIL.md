@@ -1,8 +1,6 @@
-# Krafton Jungle 
-Week 11 Team 2 WIL
+# Krafton Jungle Week 11 Team 2 WIL
 
-Project 3 VM:
-Memory Management ~ Swap In/Out
+## Project 3 VM : Memory Management ~ Swap In/Out
 
 ---
 
