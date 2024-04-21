@@ -1,5 +1,5 @@
-PintOS_Project
-크래프톤 정글 4기 pintOS과제 Project 3
+# PintOS_Project
+## 크래프톤 정글 4기 pintOS
 
 카이스트 CS330의 핀토스 과제입니다.
 
@@ -7,8 +7,12 @@ PintOS_Project
 
 이론적으로, 핀토스는 x86-64 CPU에서 돌아갈 것입니다.
 
-<hr>
 
+### Project 1,2 Team members : CamelIsTheBestConvention, EririnG, jaenam615
+---
+[PROJECT 1 WIL](https://github.com/EririnG/PintOS_Kaist/blob/main/WEEK_1_WIL.md)  
+[PROJECT 2 WIL](https://github.com/EririnG/PintOS_Kaist/blob/main/WEEK_2_WIL.md)  
 
+### Project 3 Team members : EririnG, GEUMDOHYEON, kimyerim-jungle
+---
 [PROJECT 3 WIL](https://github.com/EririnG/PintOS_Kaist/blob/main/WEEK_3_WIL.md)  
-
